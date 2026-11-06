@@ -188,6 +188,9 @@ final class UdpAssociation {
     private var source: DispatchSourceRead?
     private var closed = false
     private var clientAddress: SocketAddress?
+    /// The client endpoint has actually sent a datagram. A declared endpoint
+    /// starts unconfirmed, because some clients declare the wrong one.
+    private var clientConfirmed = false
     private let controlPeer: SocketAddress?
     private var resolutions: [String: Resolution] = [:]
     /// Insertion order, so the cache can be evicted without a second index.
@@ -337,8 +340,9 @@ final class UdpAssociation {
 
         let sourceAddress = Self.socketAddress(storage: storage, length: length)
         let packet = Data(data.prefix(Int(count)))
-        if let clientAddress {
+        if let clientAddress, clientConfirmed || sourceAddress.matches(clientAddress) {
             if sourceAddress.matches(clientAddress) {
+                clientConfirmed = true
                 handleClientDatagram(packet)
             } else {
                 // There is intentionally no destination/NAT table. Every datagram
@@ -352,11 +356,19 @@ final class UdpAssociation {
             // only with a well-formed envelope. Latching the first arbitrary sender
             // let any host that guessed the ephemeral port take over the association
             // and receive the real client's payload as if it were peer traffic.
+            //
+            // This also covers a declared endpoint that turns out to be wrong.
+            // sing-box (and other clients) put the *destination* in the UDP
+            // ASSOCIATE request instead of their own source, so the declared port
+            // never sends anything and every real datagram was wrapped as peer
+            // traffic and sent back to that port. Until the declared endpoint has
+            // actually been heard from, the control peer may still claim it.
             guard let controlPeer, sourceAddress.matchesHost(controlPeer),
                   DatagramHeader.decode(packet) != nil else {
                 return
             }
             clientAddress = sourceAddress
+            clientConfirmed = true
             handleClientDatagram(packet)
         }
     }
