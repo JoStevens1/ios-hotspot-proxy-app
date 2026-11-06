@@ -200,6 +200,18 @@ final class UdpAssociation {
     private var firstSentAt: DispatchTime?
     private var socketFD: Int32
     private var source: DispatchSourceRead?
+    /// The internet-facing leg, pinned to cellular, or -1 when there is no
+    /// cellular interface and `socketFD` carries both legs as it always did.
+    ///
+    /// `socketFD` cannot be pinned itself: it also talks to the client, which is
+    /// on WiFi. Left unpinned, iOS routes upstream datagrams by the primary
+    /// interface, and while the phone sits on the laptop's no-uplink access point
+    /// that is sometimes WiFi. NAT64 destinations are IPv6, the access point has
+    /// no IPv6, so sendto failed with EHOSTUNREACH for seconds at a time until
+    /// iOS flipped the primary back to cellular. TCP never showed this because
+    /// its upstream already requires cellular.
+    private var upstreamFD: Int32 = -1
+    private var upstreamSource: DispatchSourceRead?
     private var closed = false
     private var clientAddress: SocketAddress?
     /// The client endpoint has actually sent a datagram. A declared endpoint
@@ -291,12 +303,28 @@ final class UdpAssociation {
         }
         readSource.setCancelHandler {}
         readSource.resume()
+
+        if let cellular = Self.cellularInterfaceIndex(),
+           let upstream = try? Self.makeSocket(boundInterface: cellular) {
+            upstreamFD = upstream
+            let upstreamRead = DispatchSource.makeReadSource(fileDescriptor: upstream, queue: queue)
+            upstreamSource = upstreamRead
+            upstreamRead.setEventHandler { [weak self] in
+                self?.handleUpstreamReadable()
+            }
+            upstreamRead.setCancelHandler {}
+            upstreamRead.resume()
+        }
     }
 
     deinit {
         source?.cancel()
+        upstreamSource?.cancel()
         if socketFD >= 0 {
             Darwin.close(socketFD)
+        }
+        if upstreamFD >= 0 {
+            Darwin.close(upstreamFD)
         }
     }
 
@@ -318,16 +346,22 @@ final class UdpAssociation {
         source?.setEventHandler {}
         source?.cancel()
         source = nil
+        upstreamSource?.setEventHandler {}
+        upstreamSource?.cancel()
+        upstreamSource = nil
         if socketFD >= 0 {
             Darwin.close(socketFD)
             socketFD = -1
         }
+        if upstreamFD >= 0 {
+            Darwin.close(upstreamFD)
+            upstreamFD = -1
+        }
     }
 
-    private func handleReadable() {
-        assertQueue()
-        guard !closed else { return }
-
+    /// One datagram from `fd`, or nil when there is nothing to read. A hard
+    /// receive error fails the association.
+    private func receive(from fd: Int32) -> (packet: Data, source: SocketAddress)? {
         var data = [UInt8](repeating: 0, count: 65_535)
         let capacity = data.count
         var storage = sockaddr_storage()
@@ -336,7 +370,7 @@ final class UdpAssociation {
             withUnsafeMutablePointer(to: &storage) { storagePointer in
                 storagePointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
                     Darwin.recvfrom(
-                        socketFD,
+                        fd,
                         dataPointer.baseAddress,
                         capacity,
                         0,
@@ -351,11 +385,23 @@ final class UdpAssociation {
             if errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR {
                 onFailure()
             }
-            return
+            return nil
         }
+        return (Data(data.prefix(Int(count))), Self.socketAddress(storage: storage, length: length))
+    }
 
-        let sourceAddress = Self.socketAddress(storage: storage, length: length)
-        let packet = Data(data.prefix(Int(count)))
+    /// The cellular-pinned socket only ever hears from peers: the client is on
+    /// WiFi and never reaches it.
+    private func handleUpstreamReadable() {
+        assertQueue()
+        guard !closed, upstreamFD >= 0,
+              let (packet, sourceAddress) = receive(from: upstreamFD) else { return }
+        handlePeerDatagram(packet, from: sourceAddress)
+    }
+
+    private func handleReadable() {
+        assertQueue()
+        guard !closed, let (packet, sourceAddress) = receive(from: socketFD) else { return }
         if let clientAddress, clientConfirmed || sourceAddress.matches(clientAddress) {
             if sourceAddress.matches(clientAddress) {
                 clientConfirmed = true
@@ -529,12 +575,15 @@ final class UdpAssociation {
     ) -> Bool {
         assertQueue()
         guard !closed, socketFD >= 0 else { return false }
+        // Upstream goes out the cellular-pinned socket when there is one; the
+        // client is always answered from the WiFi-facing socket it sends to.
+        let fd = direction == .upload && upstreamFD >= 0 ? upstreamFD : socketFD
 
         let count = data.withUnsafeBytes { dataPointer in
             destination.bytes.withUnsafeBytes { addressPointer in
                 guard let address = addressPointer.baseAddress else { return -1 }
                 return Darwin.sendto(
-                    socketFD,
+                    fd,
                     dataPointer.baseAddress,
                     data.count,
                     0,
@@ -567,7 +616,48 @@ final class UdpAssociation {
         dispatchPrecondition(condition: .onQueue(queue))
     }
 
-    private static func makeSocket() throws -> Int32 {
+    /// Darwin's IPV6_BOUND_IF and IP_BOUND_IF (netinet6/in6.h, netinet/in.h).
+    /// Spelled out because the Swift overlay does not reliably export them.
+    private static let ipv6BoundInterfaceOption: Int32 = 125
+    private static let ipv4BoundInterfaceOption: Int32 = 25
+
+    /// The index of an up cellular interface (`pdp_ip*`) with a routable
+    /// address, or nil when there is none: no SIM, cellular data off, or not an
+    /// iPhone. Without one the association keeps a single unpinned socket.
+    static func cellularInterfaceIndex() -> UInt32? {
+        var head: UnsafeMutablePointer<ifaddrs>?
+        guard Darwin.getifaddrs(&head) == 0, let first = head else { return nil }
+        defer { Darwin.freeifaddrs(first) }
+
+        var cursor: UnsafeMutablePointer<ifaddrs>? = first
+        while let entry = cursor {
+            let info = entry.pointee
+            cursor = info.ifa_next
+            guard let rawName = info.ifa_name, let address = info.ifa_addr,
+                  info.ifa_flags & UInt32(IFF_UP) != 0 else { continue }
+            let name = String(cString: rawName)
+            guard name.hasPrefix("pdp_ip") else { continue }
+
+            switch Int32(address.pointee.sa_family) {
+            case AF_INET:
+                break
+            case AF_INET6:
+                let ipv6 = address.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { pointer in
+                    pointer.pointee.sin6_addr
+                }
+                let bytes = withUnsafeBytes(of: ipv6) { raw in Array(raw) }
+                let linkLocal = bytes[0] == 0xfe && bytes[1] & 0xc0 == 0x80
+                guard !linkLocal else { continue }
+            default:
+                continue
+            }
+            let index = Darwin.if_nametoindex(rawName)
+            if index != 0 { return index }
+        }
+        return nil
+    }
+
+    private static func makeSocket(boundInterface: UInt32? = nil) throws -> Int32 {
         let fd = Darwin.socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)
         guard fd >= 0 else { throw AssociationError.socket(errno) }
 
@@ -582,6 +672,31 @@ final class UdpAssociation {
             let error = errno
             Darwin.close(fd)
             throw AssociationError.option(error)
+        }
+
+        if let boundInterface {
+            var index = boundInterface
+            guard Darwin.setsockopt(
+                fd,
+                IPPROTO_IPV6,
+                ipv6BoundInterfaceOption,
+                &index,
+                socklen_t(MemoryLayout<UInt32>.size)
+            ) == 0 else {
+                let error = errno
+                Darwin.close(fd)
+                throw AssociationError.option(error)
+            }
+            // Best effort: covers IPv4-mapped destinations on carriers that do
+            // hand out IPv4. Some kernels refuse it on an AF_INET6 socket.
+            var index4 = boundInterface
+            _ = Darwin.setsockopt(
+                fd,
+                IPPROTO_IP,
+                ipv4BoundInterfaceOption,
+                &index4,
+                socklen_t(MemoryLayout<UInt32>.size)
+            )
         }
 
         var address = sockaddr_in6()
