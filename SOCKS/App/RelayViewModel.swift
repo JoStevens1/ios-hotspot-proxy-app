@@ -4,6 +4,7 @@ import AVFAudio
 import MediaPlayer
 import UIKit
 import Darwin
+import Network
 
 /// Drives the SwiftUI shell from the relay's one-second snapshots.
 ///
@@ -51,6 +52,7 @@ final class RelayViewModel: ObservableObject {
 
     private let relay = NetworkTCPRelay(countingEnabled: true)
     private let keepAlive = BackgroundKeepAlive()
+    private let logServer = RelayLogServer()
     private var timer: Timer?
     private var lastSample: (upload: UInt64, download: UInt64, at: Date)?
 
@@ -82,6 +84,8 @@ final class RelayViewModel: ObservableObject {
                     self.endpoints = Self.localEndpoints()
                     self.append("listening on \(port)")
                     self.keepAlive.start()
+                    self.logServer.start()
+                    self.append("log file: Documents/relay.log, also served on port \(RelayLogServer.port)")
                     self.append(self.keepAlive.isActive
                                 ? "background audio holding the app awake"
                                 : "background audio unavailable")
@@ -105,7 +109,9 @@ final class RelayViewModel: ObservableObject {
     private static let logLimit = 50
 
     private func append(_ text: String) {
-        log.append(LogEntry(at: Date(), text: text))
+        let now = Date()
+        RelayLogFile.shared.write(text, at: now)
+        log.append(LogEntry(at: now, text: text))
         if log.count > Self.logLimit {
             log.removeFirst(log.count - Self.logLimit)
         }
@@ -449,6 +455,101 @@ final class BackgroundKeepAlive {
             // Left inactive on purpose. The next tick tries again, and the shell
             // shows the state rather than pretending the app will survive
             // backgrounding.
+        }
+    }
+}
+
+/// Keeps the whole activity log in Documents/relay.log, beyond the 50 entries the
+/// screen shows, so it can be read off the device after the fact. Rotates to
+/// relay.log.1 at 2 MB. Holds only what the screen shows: redacted events,
+/// counts and error codes, never addresses or payload.
+final class RelayLogFile {
+    static let shared = RelayLogFile()
+
+    let url: URL
+    private let queue = DispatchQueue(label: "com.nanako.socksbypass.logfile", qos: .utility)
+    private let formatter: ISO8601DateFormatter
+    private static let maxBytes: UInt64 = 2_000_000
+
+    private init() {
+        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        url = documents.appendingPathComponent("relay.log")
+        formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    }
+
+    func write(_ text: String, at date: Date) {
+        let line = "\(formatter.string(from: date)) \(text)\n"
+        queue.async { self.appendLine(line) }
+    }
+
+    /// The previous rotation followed by the current file, oldest first.
+    func contents(completion: @escaping (Data) -> Void) {
+        queue.async {
+            var data = Data()
+            if let old = try? Data(contentsOf: self.rotatedURL) { data.append(old) }
+            if let current = try? Data(contentsOf: self.url) { data.append(current) }
+            completion(data)
+        }
+    }
+
+    private var rotatedURL: URL { url.appendingPathExtension("1") }
+
+    private func appendLine(_ line: String) {
+        let manager = FileManager.default
+        if let size = (try? manager.attributesOfItem(atPath: url.path))?[.size] as? NSNumber,
+           size.uint64Value > Self.maxBytes {
+            try? manager.removeItem(at: rotatedURL)
+            try? manager.moveItem(at: url, to: rotatedURL)
+        }
+        let data = Data(line.utf8)
+        if let handle = try? FileHandle(forWritingTo: url) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+        } else {
+            try? data.write(to: url)
+        }
+    }
+}
+
+/// Serves relay.log over plain HTTP so the tethered laptop can read it with
+/// `curl http://<phone>:9877/`. Same exposure as the relay itself, which has no
+/// authentication either, and the log carries nothing the screen does not.
+final class RelayLogServer {
+    static let port: UInt16 = 9877
+
+    private var listener: NWListener?
+    private let queue = DispatchQueue(label: "com.nanako.socksbypass.logserver", qos: .utility)
+
+    func start() {
+        guard listener == nil,
+              let port = NWEndpoint.Port(rawValue: Self.port),
+              let listener = try? NWListener(using: .tcp, on: port) else { return }
+        listener.newConnectionHandler = { [weak self] connection in
+            self?.serve(connection)
+        }
+        listener.start(queue: queue)
+        self.listener = listener
+    }
+
+    private func serve(_ connection: NWConnection) {
+        connection.start(queue: queue)
+        // Read the request before answering so the client is not reset while it
+        // is still sending. Whatever it asked for, the answer is the log.
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 8192) { _, _, _, _ in
+            RelayLogFile.shared.contents { body in
+                var response = Data((
+                    "HTTP/1.0 200 OK\r\n" +
+                    "Content-Type: text/plain; charset=utf-8\r\n" +
+                    "Content-Length: \(body.count)\r\n" +
+                    "Connection: close\r\n\r\n"
+                ).utf8)
+                response.append(body)
+                connection.send(content: response, completion: .contentProcessed { _ in
+                    connection.cancel()
+                })
+            }
         }
     }
 }
