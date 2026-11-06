@@ -184,6 +184,20 @@ final class UdpAssociation {
     private let counters: TrafficCounters
     private let resolutionQueue: DispatchQueue
     private let onFailure: () -> Void
+    private let onSendFailure: ((Int32) -> Void)?
+
+    /// What happened on this association, for the activity log. Counts only:
+    /// nothing here names a peer.
+    struct Stats: Equatable {
+        var sent = 0
+        var sendFailures = 0
+        var lastSendErrno: Int32 = 0
+        var received = 0
+        var firstReplyMilliseconds: Int?
+    }
+
+    private(set) var stats = Stats()
+    private var firstSentAt: DispatchTime?
     private var socketFD: Int32
     private var source: DispatchSourceRead?
     private var closed = false
@@ -215,11 +229,13 @@ final class UdpAssociation {
         localAddress: String,
         controlPeerAddress: String?,
         declaredClientEndpoint: (address: String, port: UInt16)? = nil,
-        onFailure: @escaping () -> Void
+        onFailure: @escaping () -> Void,
+        onSendFailure: ((Int32) -> Void)? = nil
     ) throws {
         self.queue = queue
         self.counters = counters
         self.onFailure = onFailure
+        self.onSendFailure = onSendFailure
         // RFC 1928 lets the client state the endpoint it will send from. Honouring
         // it closes the window where another process on the same host claims the
         // association by getting a well-formed datagram in first. An unspecified
@@ -486,6 +502,11 @@ final class UdpAssociation {
 
     private func handlePeerDatagram(_ payload: Data, from sourceAddress: SocketAddress) {
         assertQueue()
+        stats.received += 1
+        if stats.firstReplyMilliseconds == nil, let firstSentAt {
+            let elapsed = DispatchTime.now().uptimeNanoseconds - firstSentAt.uptimeNanoseconds
+            stats.firstReplyMilliseconds = Int(elapsed / 1_000_000)
+        }
         guard !closed, let clientAddress,
               let (addressType, address) = nat64Origin(of: sourceAddress)
                 ?? Self.headerAddress(sourceAddress),
@@ -520,6 +541,21 @@ final class UdpAssociation {
                     address.assumingMemoryBound(to: sockaddr.self),
                     destination.length
                 )
+            }
+        }
+        let sendErrno = count < 0 ? errno : 0
+        if direction == .upload {
+            if count == data.count {
+                stats.sent += 1
+                if firstSentAt == nil { firstSentAt = .now() }
+            } else {
+                // A failed upstream send used to vanish without a trace, which
+                // made a stalled association indistinguishable from a silent peer.
+                stats.sendFailures += 1
+                stats.lastSendErrno = sendErrno
+                if stats.sendFailures == 1 {
+                    onSendFailure?(sendErrno)
+                }
             }
         }
         guard count == data.count else { return false }

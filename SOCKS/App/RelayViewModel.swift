@@ -111,6 +111,10 @@ final class RelayViewModel: ObservableObject {
         }
     }
 
+    private static func errnoText(_ code: Int32) -> String {
+        "errno \(code) \(String(cString: strerror(code)))"
+    }
+
     private static func describe(_ event: NetworkTCPRelay.Event) -> String {
         switch event {
         case .sessionOpened: return "session opened"
@@ -119,6 +123,16 @@ final class RelayViewModel: ObservableObject {
         case .connectRejected(let reply): return String(format: "CONNECT rejected 0x%02x", reply)
         case .udpAssociated: return "UDP ASSOCIATE established"
         case .udpAssociateFailed: return "UDP ASSOCIATE failed"
+        case .udpSendFailed(let code):
+            return "UDP send failed: \(errnoText(code))"
+        case let .udpClosed(sent, sendFailures, lastErrno, received, firstReply):
+            var text = "UDP closed: sent \(sent)"
+            if sendFailures > 0 {
+                text += ", \(sendFailures) failed (\(errnoText(lastErrno)))"
+            }
+            text += ", got \(received)"
+            text += firstReply >= 0 ? ", first reply \(firstReply) ms" : ", no reply"
+            return text
         case .listenerFailed: return "listener failed — no longer accepting connections"
         }
     }

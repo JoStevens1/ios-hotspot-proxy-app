@@ -11,6 +11,14 @@ final class NetworkTCPRelay {
         case connectRejected(reply: UInt8)
         case udpAssociated
         case udpAssociateFailed
+        /// The first outbound UDP send on an association failed. `errno` is the
+        /// error sendto reported; later failures are only counted, in
+        /// `udpClosed`, so a stalled association cannot flood the log.
+        case udpSendFailed(errno: Int32)
+        /// A UDP association ended. Counts only. `firstReplyMilliseconds` is the
+        /// time from the first successful send to the first reply, or -1 if no
+        /// reply ever arrived.
+        case udpClosed(sent: Int, sendFailures: Int, lastErrno: Int32, received: Int, firstReplyMilliseconds: Int)
         /// The listener died after it had already reported success. The start
         /// callback fires once, so without this the shell keeps showing a
         /// listening endpoint for a relay that stopped serving.
@@ -522,6 +530,9 @@ private final class RelaySession {
                     guard let self else { return }
                     self.assertQueue()
                     self.cleanup(.udpSocketFailed)
+                },
+                onSendFailure: { [weak self] code in
+                    self?.emit(.udpSendFailed(errno: code))
                 }
             )
             guard let reply = association.replyData(localAddress: localAddress) else {
@@ -1066,7 +1077,15 @@ private final class RelaySession {
         target?.stateUpdateHandler = nil
         client.cancel()
         target?.cancel()
-        if udpAssociation != nil {
+        if let association = udpAssociation {
+            let stats = association.stats
+            emit(.udpClosed(
+                sent: stats.sent,
+                sendFailures: stats.sendFailures,
+                lastErrno: stats.lastSendErrno,
+                received: stats.received,
+                firstReplyMilliseconds: stats.firstReplyMilliseconds ?? -1
+            ))
             udpAssociation?.cancel()
             udpAssociation = nil
             counters.associationClosed(id)
