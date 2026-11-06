@@ -82,6 +82,14 @@ same guarantee from a heuristic into an enforced one.
 
 The relay also supports **UDP ASSOCIATE**, so DNS over UDP works too.
 
+**IPv6-only carriers (T-Mobile US and others).** Destinations given as an IPv4
+address, rather than a hostname, are rewritten to the carrier's NAT64 address
+with `getaddrinfo(AI_DEFAULT)`, for both `CONNECT` and UDP. Without this, every
+request that names an IPv4 address fails with reply `0x01`, which breaks a
+laptop-side TUN (tun2socks, sing-box) and anything that connects by IP, such as
+Discord voice. UDP replies from a rewritten address are reported back under the
+original IPv4 address. On networks with native IPv4 nothing changes.
+
 ## ⚠️ No password. Read before you run this.
 
 **The listener binds `0.0.0.0` and there is NO authentication of any kind.**

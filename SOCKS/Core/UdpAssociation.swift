@@ -192,6 +192,9 @@ final class UdpAssociation {
     private var resolutions: [String: Resolution] = [:]
     /// Insertion order, so the cache can be evicted without a second index.
     private var resolutionOrder: [String] = []
+    /// Synthesized NAT64 address (16 bytes) to the IPv4 literal the client sent
+    /// to, so replies go back under the address the client expects.
+    private var nat64Origins: [Data: String] = [:]
     private var pendingResolutions = 0
     /// At most one datagram per in-flight lookup, replayed once it resolves.
     private var pendingDatagrams: [String: (payload: Data, port: UInt16)] = [:]
@@ -363,14 +366,17 @@ final class UdpAssociation {
         guard !closed, let decoded = DatagramHeader.decode(packet) else { return }
 
         switch decoded.header.addressType {
-        case .ipv4, .ipv6:
+        case .ipv6:
             guard let destination = Self.numericAddress(
                 decoded.header.address,
                 port: decoded.header.port
             ) else { return }
             _ = send(decoded.payload, to: destination, direction: .upload)
 
-        case .domain:
+        // IPv4 literals take the lookup path too: on IPv6-only cellular their
+        // IPv4-mapped form has no route, and only getaddrinfo can produce the
+        // NAT64 address that does. See `NAT64`.
+        case .ipv4, .domain:
             let key = decoded.header.address.lowercased()
             switch resolutions[key] {
             case .resolved(let destinations):
@@ -398,8 +404,9 @@ final class UdpAssociation {
                 pendingDatagrams[key] = (decoded.payload, decoded.header.port)
                 evictResolutions()
                 let host = decoded.header.address
+                let isIPv4Literal = NAT64.isIPv4Literal(host)
                 resolutionQueue.async { [weak self] in
-                    let result = Self.resolve(host)
+                    let result = isIPv4Literal ? Self.resolveIPv4Literal(host) : Self.resolve(host)
                     self?.queue.async { [weak self] in
                         guard let self, !self.closed else { return }
                         self.pendingResolutions -= 1
@@ -417,6 +424,12 @@ final class UdpAssociation {
                             return
                         }
                         self.resolutions[key] = .resolved(result)
+                        if isIPv4Literal {
+                            for destination in result {
+                                guard let address = Self.nat64AddressBytes(destination) else { continue }
+                                self.nat64Origins[address] = host
+                            }
+                        }
                         guard let queued else { return }
                         for destination in result
                         where self.send(queued.payload, to: destination.withPort(queued.port),
@@ -443,13 +456,27 @@ final class UdpAssociation {
             }
             resolutions.removeValue(forKey: key)
             resolutionOrder.remove(at: index)
+            if NAT64.isIPv4Literal(key) {
+                nat64Origins = nat64Origins.filter { $0.value != key }
+            }
         }
+    }
+
+    /// A reply from a synthesized NAT64 address is labelled with the IPv4
+    /// literal the client sent to. Labelled with the IPv6 address instead, it
+    /// looks like a datagram from an unknown peer, and clients that match
+    /// replies to their destination (Discord voice, DTLS, games) drop it.
+    private func nat64Origin(of address: SocketAddress) -> (AddressType, String)? {
+        guard let bytes = Self.nat64AddressBytes(address),
+              let origin = nat64Origins[bytes] else { return nil }
+        return (.ipv4, origin)
     }
 
     private func handlePeerDatagram(_ payload: Data, from sourceAddress: SocketAddress) {
         assertQueue()
         guard !closed, let clientAddress,
-              let (addressType, address) = Self.headerAddress(sourceAddress),
+              let (addressType, address) = nat64Origin(of: sourceAddress)
+                ?? Self.headerAddress(sourceAddress),
               let packet = DatagramHeader.encode(
                 addressType: addressType,
                 address: address,
@@ -590,6 +617,33 @@ final class UdpAssociation {
         var reply = Data([0x05, 0x00, 0x00])
         reply.append(contentsOf: encoded.dropFirst(3))
         return reply
+    }
+
+    /// An IPv4 literal as a destination for the association socket: the
+    /// synthesized NAT64 address on IPv6-only networks, otherwise the literal in
+    /// IPv4-mapped form exactly as before. Same AF_INET6 invariant as `resolve`.
+    static func resolveIPv4Literal(_ literal: String) -> [SocketAddress] {
+        guard let synthesized = NAT64.synthesizedIPv6(forIPv4Literal: literal) else {
+            return numericAddress(literal, port: 0).map { [$0] } ?? []
+        }
+        var sockaddr = sockaddr_in6()
+        sockaddr.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+        sockaddr.sin6_family = sa_family_t(AF_INET6)
+        sockaddr.sin6_port = 0
+        withUnsafeMutableBytes(of: &sockaddr.sin6_addr) { $0.copyBytes(from: synthesized) }
+        return [SocketAddress(
+            bytes: Data(bytes: &sockaddr, count: MemoryLayout<sockaddr_in6>.size),
+            length: socklen_t(MemoryLayout<sockaddr_in6>.size),
+            family: sa_family_t(AF_INET6)
+        )]
+    }
+
+    /// The 16 address bytes of an AF_INET6 address that is not IPv4-mapped, the
+    /// only kind a NAT64 synthesis can produce.
+    private static func nat64AddressBytes(_ address: SocketAddress) -> Data? {
+        guard address.family == sa_family_t(AF_INET6), address.bytes.count >= 24 else { return nil }
+        let bytes = Data(address.bytes[address.bytes.startIndex + 8..<address.bytes.startIndex + 24])
+        return NAT64.isIPv4Mapped(bytes) ? nil : bytes
     }
 
     /// Internal rather than private so the family invariant can be asserted:
