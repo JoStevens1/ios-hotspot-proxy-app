@@ -184,14 +184,46 @@ final class UdpAssociation {
     private let counters: TrafficCounters
     private let resolutionQueue: DispatchQueue
     private let onFailure: () -> Void
+    private let onSendFailure: ((Int32) -> Void)?
+
+    /// What happened on this association, for the activity log. Counts only:
+    /// nothing here names a peer.
+    struct Stats: Equatable {
+        var sent = 0
+        var sendFailures = 0
+        var lastSendErrno: Int32 = 0
+        var received = 0
+        var firstReplyMilliseconds: Int?
+    }
+
+    private(set) var stats = Stats()
+    private var firstSentAt: DispatchTime?
     private var socketFD: Int32
     private var source: DispatchSourceRead?
+    /// The internet-facing leg, pinned to cellular, or -1 when there is no
+    /// cellular interface and `socketFD` carries both legs as it always did.
+    ///
+    /// `socketFD` cannot be pinned itself: it also talks to the client, which is
+    /// on WiFi. Left unpinned, iOS routes upstream datagrams by the primary
+    /// interface, and while the phone sits on the laptop's no-uplink access point
+    /// that is sometimes WiFi. NAT64 destinations are IPv6, the access point has
+    /// no IPv6, so sendto failed with EHOSTUNREACH for seconds at a time until
+    /// iOS flipped the primary back to cellular. TCP never showed this because
+    /// its upstream already requires cellular.
+    private var upstreamFD: Int32 = -1
+    private var upstreamSource: DispatchSourceRead?
     private var closed = false
     private var clientAddress: SocketAddress?
+    /// The client endpoint has actually sent a datagram. A declared endpoint
+    /// starts unconfirmed, because some clients declare the wrong one.
+    private var clientConfirmed = false
     private let controlPeer: SocketAddress?
     private var resolutions: [String: Resolution] = [:]
     /// Insertion order, so the cache can be evicted without a second index.
     private var resolutionOrder: [String] = []
+    /// Synthesized NAT64 address (16 bytes) to the IPv4 literal the client sent
+    /// to, so replies go back under the address the client expects.
+    private var nat64Origins: [Data: String] = [:]
     private var pendingResolutions = 0
     /// At most one datagram per in-flight lookup, replayed once it resolves.
     private var pendingDatagrams: [String: (payload: Data, port: UInt16)] = [:]
@@ -209,11 +241,13 @@ final class UdpAssociation {
         localAddress: String,
         controlPeerAddress: String?,
         declaredClientEndpoint: (address: String, port: UInt16)? = nil,
-        onFailure: @escaping () -> Void
+        onFailure: @escaping () -> Void,
+        onSendFailure: ((Int32) -> Void)? = nil
     ) throws {
         self.queue = queue
         self.counters = counters
         self.onFailure = onFailure
+        self.onSendFailure = onSendFailure
         // RFC 1928 lets the client state the endpoint it will send from. Honouring
         // it closes the window where another process on the same host claims the
         // association by getting a well-formed datagram in first. An unspecified
@@ -269,12 +303,28 @@ final class UdpAssociation {
         }
         readSource.setCancelHandler {}
         readSource.resume()
+
+        if let cellular = Self.cellularInterfaceIndex(),
+           let upstream = try? Self.makeSocket(boundInterface: cellular) {
+            upstreamFD = upstream
+            let upstreamRead = DispatchSource.makeReadSource(fileDescriptor: upstream, queue: queue)
+            upstreamSource = upstreamRead
+            upstreamRead.setEventHandler { [weak self] in
+                self?.handleUpstreamReadable()
+            }
+            upstreamRead.setCancelHandler {}
+            upstreamRead.resume()
+        }
     }
 
     deinit {
         source?.cancel()
+        upstreamSource?.cancel()
         if socketFD >= 0 {
             Darwin.close(socketFD)
+        }
+        if upstreamFD >= 0 {
+            Darwin.close(upstreamFD)
         }
     }
 
@@ -296,16 +346,22 @@ final class UdpAssociation {
         source?.setEventHandler {}
         source?.cancel()
         source = nil
+        upstreamSource?.setEventHandler {}
+        upstreamSource?.cancel()
+        upstreamSource = nil
         if socketFD >= 0 {
             Darwin.close(socketFD)
             socketFD = -1
         }
+        if upstreamFD >= 0 {
+            Darwin.close(upstreamFD)
+            upstreamFD = -1
+        }
     }
 
-    private func handleReadable() {
-        assertQueue()
-        guard !closed else { return }
-
+    /// One datagram from `fd`, or nil when there is nothing to read. A hard
+    /// receive error fails the association.
+    private func receive(from fd: Int32) -> (packet: Data, source: SocketAddress)? {
         var data = [UInt8](repeating: 0, count: 65_535)
         let capacity = data.count
         var storage = sockaddr_storage()
@@ -314,7 +370,7 @@ final class UdpAssociation {
             withUnsafeMutablePointer(to: &storage) { storagePointer in
                 storagePointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
                     Darwin.recvfrom(
-                        socketFD,
+                        fd,
                         dataPointer.baseAddress,
                         capacity,
                         0,
@@ -329,13 +385,26 @@ final class UdpAssociation {
             if errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR {
                 onFailure()
             }
-            return
+            return nil
         }
+        return (Data(data.prefix(Int(count))), Self.socketAddress(storage: storage, length: length))
+    }
 
-        let sourceAddress = Self.socketAddress(storage: storage, length: length)
-        let packet = Data(data.prefix(Int(count)))
-        if let clientAddress {
+    /// The cellular-pinned socket only ever hears from peers: the client is on
+    /// WiFi and never reaches it.
+    private func handleUpstreamReadable() {
+        assertQueue()
+        guard !closed, upstreamFD >= 0,
+              let (packet, sourceAddress) = receive(from: upstreamFD) else { return }
+        handlePeerDatagram(packet, from: sourceAddress)
+    }
+
+    private func handleReadable() {
+        assertQueue()
+        guard !closed, let (packet, sourceAddress) = receive(from: socketFD) else { return }
+        if let clientAddress, clientConfirmed || sourceAddress.matches(clientAddress) {
             if sourceAddress.matches(clientAddress) {
+                clientConfirmed = true
                 handleClientDatagram(packet)
             } else {
                 // There is intentionally no destination/NAT table. Every datagram
@@ -349,11 +418,19 @@ final class UdpAssociation {
             // only with a well-formed envelope. Latching the first arbitrary sender
             // let any host that guessed the ephemeral port take over the association
             // and receive the real client's payload as if it were peer traffic.
+            //
+            // This also covers a declared endpoint that turns out to be wrong.
+            // sing-box (and other clients) put the *destination* in the UDP
+            // ASSOCIATE request instead of their own source, so the declared port
+            // never sends anything and every real datagram was wrapped as peer
+            // traffic and sent back to that port. Until the declared endpoint has
+            // actually been heard from, the control peer may still claim it.
             guard let controlPeer, sourceAddress.matchesHost(controlPeer),
                   DatagramHeader.decode(packet) != nil else {
                 return
             }
             clientAddress = sourceAddress
+            clientConfirmed = true
             handleClientDatagram(packet)
         }
     }
@@ -363,14 +440,17 @@ final class UdpAssociation {
         guard !closed, let decoded = DatagramHeader.decode(packet) else { return }
 
         switch decoded.header.addressType {
-        case .ipv4, .ipv6:
+        case .ipv6:
             guard let destination = Self.numericAddress(
                 decoded.header.address,
                 port: decoded.header.port
             ) else { return }
             _ = send(decoded.payload, to: destination, direction: .upload)
 
-        case .domain:
+        // IPv4 literals take the lookup path too: on IPv6-only cellular their
+        // IPv4-mapped form has no route, and only getaddrinfo can produce the
+        // NAT64 address that does. See `NAT64`.
+        case .ipv4, .domain:
             let key = decoded.header.address.lowercased()
             switch resolutions[key] {
             case .resolved(let destinations):
@@ -398,8 +478,9 @@ final class UdpAssociation {
                 pendingDatagrams[key] = (decoded.payload, decoded.header.port)
                 evictResolutions()
                 let host = decoded.header.address
+                let isIPv4Literal = NAT64.isIPv4Literal(host)
                 resolutionQueue.async { [weak self] in
-                    let result = Self.resolve(host)
+                    let result = isIPv4Literal ? Self.resolveIPv4Literal(host) : Self.resolve(host)
                     self?.queue.async { [weak self] in
                         guard let self, !self.closed else { return }
                         self.pendingResolutions -= 1
@@ -417,6 +498,12 @@ final class UdpAssociation {
                             return
                         }
                         self.resolutions[key] = .resolved(result)
+                        if isIPv4Literal {
+                            for destination in result {
+                                guard let address = Self.nat64AddressBytes(destination) else { continue }
+                                self.nat64Origins[address] = host
+                            }
+                        }
                         guard let queued else { return }
                         for destination in result
                         where self.send(queued.payload, to: destination.withPort(queued.port),
@@ -443,13 +530,32 @@ final class UdpAssociation {
             }
             resolutions.removeValue(forKey: key)
             resolutionOrder.remove(at: index)
+            if NAT64.isIPv4Literal(key) {
+                nat64Origins = nat64Origins.filter { $0.value != key }
+            }
         }
+    }
+
+    /// A reply from a synthesized NAT64 address is labelled with the IPv4
+    /// literal the client sent to. Labelled with the IPv6 address instead, it
+    /// looks like a datagram from an unknown peer, and clients that match
+    /// replies to their destination (Discord voice, DTLS, games) drop it.
+    private func nat64Origin(of address: SocketAddress) -> (AddressType, String)? {
+        guard let bytes = Self.nat64AddressBytes(address),
+              let origin = nat64Origins[bytes] else { return nil }
+        return (.ipv4, origin)
     }
 
     private func handlePeerDatagram(_ payload: Data, from sourceAddress: SocketAddress) {
         assertQueue()
+        stats.received += 1
+        if stats.firstReplyMilliseconds == nil, let firstSentAt {
+            let elapsed = DispatchTime.now().uptimeNanoseconds - firstSentAt.uptimeNanoseconds
+            stats.firstReplyMilliseconds = Int(elapsed / 1_000_000)
+        }
         guard !closed, let clientAddress,
-              let (addressType, address) = Self.headerAddress(sourceAddress),
+              let (addressType, address) = nat64Origin(of: sourceAddress)
+                ?? Self.headerAddress(sourceAddress),
               let packet = DatagramHeader.encode(
                 addressType: addressType,
                 address: address,
@@ -469,18 +575,36 @@ final class UdpAssociation {
     ) -> Bool {
         assertQueue()
         guard !closed, socketFD >= 0 else { return false }
+        // Upstream goes out the cellular-pinned socket when there is one; the
+        // client is always answered from the WiFi-facing socket it sends to.
+        let fd = direction == .upload && upstreamFD >= 0 ? upstreamFD : socketFD
 
         let count = data.withUnsafeBytes { dataPointer in
             destination.bytes.withUnsafeBytes { addressPointer in
                 guard let address = addressPointer.baseAddress else { return -1 }
                 return Darwin.sendto(
-                    socketFD,
+                    fd,
                     dataPointer.baseAddress,
                     data.count,
                     0,
                     address.assumingMemoryBound(to: sockaddr.self),
                     destination.length
                 )
+            }
+        }
+        let sendErrno = count < 0 ? errno : 0
+        if direction == .upload {
+            if count == data.count {
+                stats.sent += 1
+                if firstSentAt == nil { firstSentAt = .now() }
+            } else {
+                // A failed upstream send used to vanish without a trace, which
+                // made a stalled association indistinguishable from a silent peer.
+                stats.sendFailures += 1
+                stats.lastSendErrno = sendErrno
+                if stats.sendFailures == 1 {
+                    onSendFailure?(sendErrno)
+                }
             }
         }
         guard count == data.count else { return false }
@@ -492,7 +616,48 @@ final class UdpAssociation {
         dispatchPrecondition(condition: .onQueue(queue))
     }
 
-    private static func makeSocket() throws -> Int32 {
+    /// Darwin's IPV6_BOUND_IF and IP_BOUND_IF (netinet6/in6.h, netinet/in.h).
+    /// Spelled out because the Swift overlay does not reliably export them.
+    private static let ipv6BoundInterfaceOption: Int32 = 125
+    private static let ipv4BoundInterfaceOption: Int32 = 25
+
+    /// The index of an up cellular interface (`pdp_ip*`) with a routable
+    /// address, or nil when there is none: no SIM, cellular data off, or not an
+    /// iPhone. Without one the association keeps a single unpinned socket.
+    static func cellularInterfaceIndex() -> UInt32? {
+        var head: UnsafeMutablePointer<ifaddrs>?
+        guard Darwin.getifaddrs(&head) == 0, let first = head else { return nil }
+        defer { Darwin.freeifaddrs(first) }
+
+        var cursor: UnsafeMutablePointer<ifaddrs>? = first
+        while let entry = cursor {
+            let info = entry.pointee
+            cursor = info.ifa_next
+            guard let rawName = info.ifa_name, let address = info.ifa_addr,
+                  info.ifa_flags & UInt32(IFF_UP) != 0 else { continue }
+            let name = String(cString: rawName)
+            guard name.hasPrefix("pdp_ip") else { continue }
+
+            switch Int32(address.pointee.sa_family) {
+            case AF_INET:
+                break
+            case AF_INET6:
+                let ipv6 = address.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { pointer in
+                    pointer.pointee.sin6_addr
+                }
+                let bytes = withUnsafeBytes(of: ipv6) { raw in Array(raw) }
+                let linkLocal = bytes[0] == 0xfe && bytes[1] & 0xc0 == 0x80
+                guard !linkLocal else { continue }
+            default:
+                continue
+            }
+            let index = Darwin.if_nametoindex(rawName)
+            if index != 0 { return index }
+        }
+        return nil
+    }
+
+    private static func makeSocket(boundInterface: UInt32? = nil) throws -> Int32 {
         let fd = Darwin.socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)
         guard fd >= 0 else { throw AssociationError.socket(errno) }
 
@@ -507,6 +672,31 @@ final class UdpAssociation {
             let error = errno
             Darwin.close(fd)
             throw AssociationError.option(error)
+        }
+
+        if let boundInterface {
+            var index = boundInterface
+            guard Darwin.setsockopt(
+                fd,
+                IPPROTO_IPV6,
+                ipv6BoundInterfaceOption,
+                &index,
+                socklen_t(MemoryLayout<UInt32>.size)
+            ) == 0 else {
+                let error = errno
+                Darwin.close(fd)
+                throw AssociationError.option(error)
+            }
+            // Best effort: covers IPv4-mapped destinations on carriers that do
+            // hand out IPv4. Some kernels refuse it on an AF_INET6 socket.
+            var index4 = boundInterface
+            _ = Darwin.setsockopt(
+                fd,
+                IPPROTO_IP,
+                ipv4BoundInterfaceOption,
+                &index4,
+                socklen_t(MemoryLayout<UInt32>.size)
+            )
         }
 
         var address = sockaddr_in6()
@@ -590,6 +780,33 @@ final class UdpAssociation {
         var reply = Data([0x05, 0x00, 0x00])
         reply.append(contentsOf: encoded.dropFirst(3))
         return reply
+    }
+
+    /// An IPv4 literal as a destination for the association socket: the
+    /// synthesized NAT64 address on IPv6-only networks, otherwise the literal in
+    /// IPv4-mapped form exactly as before. Same AF_INET6 invariant as `resolve`.
+    static func resolveIPv4Literal(_ literal: String) -> [SocketAddress] {
+        guard let synthesized = NAT64.synthesizedIPv6(forIPv4Literal: literal) else {
+            return numericAddress(literal, port: 0).map { [$0] } ?? []
+        }
+        var sockaddr = sockaddr_in6()
+        sockaddr.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+        sockaddr.sin6_family = sa_family_t(AF_INET6)
+        sockaddr.sin6_port = 0
+        withUnsafeMutableBytes(of: &sockaddr.sin6_addr) { $0.copyBytes(from: synthesized) }
+        return [SocketAddress(
+            bytes: Data(bytes: &sockaddr, count: MemoryLayout<sockaddr_in6>.size),
+            length: socklen_t(MemoryLayout<sockaddr_in6>.size),
+            family: sa_family_t(AF_INET6)
+        )]
+    }
+
+    /// The 16 address bytes of an AF_INET6 address that is not IPv4-mapped, the
+    /// only kind a NAT64 synthesis can produce.
+    private static func nat64AddressBytes(_ address: SocketAddress) -> Data? {
+        guard address.family == sa_family_t(AF_INET6), address.bytes.count >= 24 else { return nil }
+        let bytes = Data(address.bytes[address.bytes.startIndex + 8..<address.bytes.startIndex + 24])
+        return NAT64.isIPv4Mapped(bytes) ? nil : bytes
     }
 
     /// Internal rather than private so the family invariant can be asserted:

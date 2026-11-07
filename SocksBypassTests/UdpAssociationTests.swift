@@ -567,4 +567,30 @@ extension UdpAssociationTests {
             )
         }
     }
+
+    func testNAT64OnlyRewritesIPv4Literals() {
+        XCTAssertTrue(NAT64.isIPv4Literal("192.0.2.1"))
+        XCTAssertFalse(NAT64.isIPv4Literal("example.com"))
+        XCTAssertFalse(NAT64.isIPv4Literal("::1"))
+        XCTAssertFalse(NAT64.isIPv4Literal("1.2.3"))
+        XCTAssertNil(NAT64.synthesizedIPv6(forIPv4Literal: "example.com"))
+        XCTAssertNil(NAT64.synthesizedIPv6(forIPv4Literal: "::1"))
+    }
+
+    func testIPv4MappedAddressIsNotTreatedAsSynthesized() {
+        let mapped = Data([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2, 1])
+        let synthesized = Data([0, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 2, 1])
+        XCTAssertTrue(NAT64.isIPv4Mapped(mapped))
+        XCTAssertFalse(NAT64.isIPv4Mapped(synthesized))
+    }
+
+    /// Same invariant as `resolve`: whichever network the tests run on, an IPv4
+    /// literal must come back as an AF_INET6 sockaddr the association can send to.
+    func testIPv4LiteralResolvesToDualStackAddress() {
+        let addresses = UdpAssociation.resolveIPv4Literal("127.0.0.1")
+        XCTAssertEqual(addresses.count, 1)
+        for address in addresses {
+            XCTAssertEqual(address.family, sa_family_t(AF_INET6))
+        }
+    }
 }

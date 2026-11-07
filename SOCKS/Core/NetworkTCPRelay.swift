@@ -11,6 +11,14 @@ final class NetworkTCPRelay {
         case connectRejected(reply: UInt8)
         case udpAssociated
         case udpAssociateFailed
+        /// The first outbound UDP send on an association failed. `errno` is the
+        /// error sendto reported; later failures are only counted, in
+        /// `udpClosed`, so a stalled association cannot flood the log.
+        case udpSendFailed(errno: Int32)
+        /// A UDP association ended. Counts only. `firstReplyMilliseconds` is the
+        /// time from the first successful send to the first reply, or -1 if no
+        /// reply ever arrived.
+        case udpClosed(sent: Int, sendFailures: Int, lastErrno: Int32, received: Int, firstReplyMilliseconds: Int)
         /// The listener died after it had already reported success. The start
         /// callback fires once, so without this the shell keeps showing a
         /// listening endpoint for a relay that stopped serving.
@@ -234,6 +242,77 @@ final class NetworkTCPRelay {
     }
 }
 
+/// IPv4 literals on IPv6-only cellular.
+///
+/// Carriers such as T-Mobile US give the phone no IPv4 at all and reach the
+/// IPv4 internet through NAT64. A hostname works because DNS64 hands back a
+/// synthesized AAAA record, but an IPv4 literal has no lookup to rewrite:
+/// NWConnection to one never becomes ready, and a raw sendto to its
+/// IPv4-mapped form has no route. Every CONNECT or UDP datagram that names an
+/// IPv4 address therefore failed with reply 0x01, which breaks any client that
+/// routes by IP (a TUN on the laptop, Discord voice, games).
+///
+/// Apple's documented fix is to pass the literal through getaddrinfo with
+/// AI_DEFAULT: on a NAT64 network it returns the synthesized IPv6 address, and
+/// on a network with native IPv4 it returns the IPv4 address unchanged.
+enum NAT64 {
+    /// getaddrinfo can block while the system discovers the NAT64 prefix, so
+    /// lookups never run on a relay queue.
+    static let lookupQueue = DispatchQueue(
+        label: "com.nanako.socksbypass.nat64",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
+
+    static func isIPv4Literal(_ address: String) -> Bool {
+        var value = in_addr()
+        return address.withCString { Darwin.inet_pton(AF_INET, $0, &value) } == 1
+    }
+
+    /// The 16 bytes of the NAT64 address synthesized for `literal`, or nil when
+    /// `literal` is not an IPv4 address or the current network has native IPv4.
+    /// Blocking; call it from `lookupQueue`.
+    static func synthesizedIPv6(forIPv4Literal literal: String) -> Data? {
+        guard isIPv4Literal(literal) else { return nil }
+
+        var hints = addrinfo()
+        hints.ai_flags = AI_DEFAULT
+        hints.ai_family = AF_UNSPEC
+        hints.ai_socktype = SOCK_STREAM
+
+        var result: UnsafeMutablePointer<addrinfo>?
+        let status = literal.withCString {
+            Darwin.getaddrinfo($0, nil, &hints, &result)
+        }
+        guard status == 0, let first = result else { return nil }
+        defer { Darwin.freeaddrinfo(first) }
+
+        var item: UnsafeMutablePointer<addrinfo>? = first
+        while let current = item {
+            let info = current.pointee
+            if info.ai_family == AF_INET6, let raw = info.ai_addr {
+                let address = raw.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) {
+                    $0.pointee.sin6_addr
+                }
+                let bytes = withUnsafeBytes(of: address) { Data($0) }
+                // An IPv4-mapped result is the IPv4 address again, no more
+                // reachable without IPv4 than the literal itself.
+                if !isIPv4Mapped(bytes) {
+                    return bytes
+                }
+            }
+            item = info.ai_next
+        }
+        return nil
+    }
+
+    static func isIPv4Mapped(_ bytes: Data) -> Bool {
+        let value = [UInt8](bytes)
+        guard value.count == 16 else { return false }
+        return value.prefix(10).allSatisfy { $0 == 0 } && value[10] == 0xff && value[11] == 0xff
+    }
+}
+
 private enum CleanupReason: String {
     case handshakeTimeout
     case relayStop
@@ -290,6 +369,8 @@ private final class RelaySession {
     private var targetReadComplete = false
     private var handshakeReceivePending = false
     private var handshakeTimeout: DispatchWorkItem?
+    /// A CONNECT to an IPv4 literal is waiting on its NAT64 lookup.
+    private var targetLookupPending = false
     private var clientReceivePending = false
     private var targetReceivePending = false
     // A receive must never overtake the send carrying the previous payload. The
@@ -449,6 +530,9 @@ private final class RelaySession {
                     guard let self else { return }
                     self.assertQueue()
                     self.cleanup(.udpSocketFailed)
+                },
+                onSendFailure: { [weak self] code in
+                    self?.emit(.udpSendFailed(errno: code))
                 }
             )
             guard let reply = association.replyData(localAddress: localAddress) else {
@@ -527,14 +611,43 @@ private final class RelaySession {
         assertQueue()
         handshakeTimeout?.cancel()
         handshakeTimeout = nil
-        guard !cleaned, target == nil,
+        guard !cleaned, target == nil, !targetLookupPending,
               let port = NWEndpoint.Port(rawValue: request.target.port) else {
             sendRequestFailure(0x01)
             return
         }
 
+        let address = request.target.address
+        guard NAT64.isIPv4Literal(address) else {
+            startTargetConnection(host: NWEndpoint.Host(address), port: port)
+            return
+        }
+
+        // See `NAT64`: an IPv4 literal is unreachable on IPv6-only cellular
+        // until it is rewritten to the carrier's synthesized IPv6 address.
+        targetLookupPending = true
+        NAT64.lookupQueue.async { [weak self] in
+            let synthesized = NAT64.synthesizedIPv6(forIPv4Literal: address)
+            self?.queue.async { [weak self] in
+                guard let self else { return }
+                self.targetLookupPending = false
+                // The client may have gone away while the lookup ran.
+                guard !self.cleaned, self.target == nil else { return }
+                let host: NWEndpoint.Host
+                if let synthesized, let ipv6 = IPv6Address(synthesized) {
+                    host = .ipv6(ipv6)
+                } else {
+                    host = NWEndpoint.Host(address)
+                }
+                self.startTargetConnection(host: host, port: port)
+            }
+        }
+    }
+
+    private func startTargetConnection(host: NWEndpoint.Host, port: NWEndpoint.Port) {
+        assertQueue()
         let target = NWConnection(
-            host: NWEndpoint.Host(request.target.address),
+            host: host,
             port: port,
             using: NetworkTCPRelay.makeUpstreamTCPParameters()
         )
@@ -964,7 +1077,15 @@ private final class RelaySession {
         target?.stateUpdateHandler = nil
         client.cancel()
         target?.cancel()
-        if udpAssociation != nil {
+        if let association = udpAssociation {
+            let stats = association.stats
+            emit(.udpClosed(
+                sent: stats.sent,
+                sendFailures: stats.sendFailures,
+                lastErrno: stats.lastSendErrno,
+                received: stats.received,
+                firstReplyMilliseconds: stats.firstReplyMilliseconds ?? -1
+            ))
             udpAssociation?.cancel()
             udpAssociation = nil
             counters.associationClosed(id)

@@ -57,12 +57,13 @@ Why invert it:
 - So the phone must **join** a network instead of serving one.
 - The laptop's access point has **no internet uplink** — it only carries the
   SOCKS5 session.
-- With no uplink on WiFi, iOS fails over to cellular implicitly. Outbound
-  traffic has exactly one route out: the radio.
+- With no uplink on WiFi, iOS fails over to cellular. Outbound traffic has
+  exactly one route out: the radio.
 
-That implicit failover is why the app works. The upstream connection is also
-pinned to cellular explicitly (see [Known gaps](#known-gaps)), which turns the
-same guarantee from a heuristic into an enforced one.
+That failover is a heuristic, though, and it is not instant. iOS sometimes
+keeps the uplink-less WiFi as its primary interface for several seconds, so
+the relay does not rely on it: upstream TCP and UDP are both pinned to
+cellular explicitly. The WiFi side only ever carries the SOCKS5 session.
 
 ### Setting it up
 
@@ -82,6 +83,36 @@ same guarantee from a heuristic into an enforced one.
 
 The relay also supports **UDP ASSOCIATE**, so DNS over UDP works too.
 
+**IPv6-only carriers (T-Mobile US and others).** Destinations given as an IPv4
+address, rather than a hostname, are rewritten to the carrier's NAT64 address
+with `getaddrinfo(AI_DEFAULT)`, for both `CONNECT` and UDP. Without this, every
+request that names an IPv4 address fails with reply `0x01`, which breaks a
+laptop-side TUN (tun2socks, sing-box) and anything that connects by IP, such as
+Discord voice. UDP replies from a rewritten address are reported back under the
+original IPv4 address. On networks with native IPv4 nothing changes.
+
+**Clients that declare the wrong UDP endpoint.** RFC 1928 has a UDP ASSOCIATE
+request name the address the client will send from. sing-box puts the first
+datagram's *destination* there instead. A declared endpoint is therefore only a
+hint: until it actually sends, the control connection's host can still claim
+the association with a well-formed datagram.
+
+### Diagnostics
+
+The on-screen activity log keeps the last 50 entries. Every entry is also
+written, timestamped, to `Documents/relay.log` (rotated to `relay.log.1` at
+2 MB), which the Files app can see. The laptop can read it directly:
+
+```sh
+curl http://<phone-ip>:9877/
+```
+
+Besides sessions opening and closing, it records UDP problems that are
+otherwise silent: the first failed upstream send on an association, with its
+`errno`, and a per-association summary when it closes (datagrams sent, failed
+and received, and how long the first reply took). The log carries event names,
+counts and error codes only, never addresses or payload.
+
 ## ⚠️ No password. Read before you run this.
 
 **The listener binds `0.0.0.0` and there is NO authentication of any kind.**
@@ -98,6 +129,10 @@ token, no IP allowlist, no rate limit.
   untrusted network — the bind is not restricted to the WiFi interface.
 - Be aware that the phone joins your laptop's AP, so anyone within radio range
   of the laptop can reach the phone.
+
+The log server on port **9877** has the same exposure: anyone who can reach the
+phone can read the activity log. It holds no addresses or payload, but it does
+show when and how much the relay is used.
 
 The safest pattern is to start the relay only for the duration you need it, and
 stop it when you are done.
@@ -297,28 +332,12 @@ This comes up, so the short version:
 
 Things that are **not** fixed in this fork. Read before relying on them.
 
-### 1. The cellular pin is TCP-only — UDP egress is unpinned
-
-Outbound **TCP** connections are pinned to cellular with
-`requiredInterfaceType = .cellular`. Outbound **UDP** is not.
-
-`UdpAssociation.swift` does not use Network.framework at all — it owns a raw
-BSD socket (`Darwin.socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)`) and uses
-`sendto`. `requiredInterfaceType` has no equivalent there short of
-`IP_BOUND_IF`-style socket options, which is a much larger change than this
-fork is making.
-
-On this topology it does not matter in practice — the laptop's access point has
-no uplink, so WiFi cannot carry UDP out either, and it fails over to cellular
-implicitly like everything else. But the guarantee is **not** enforced for UDP.
-Anything that changes that assumption could regress DNS-over-UDP quietly.
-
-### 2. There is no authentication. See the warning above.
+### 1. There is no authentication. See the warning above.
 
 Not a gap to be fixed later — a property of the design. Listed here so it is not
 mistaken for an oversight.
 
-### 3. The background keepalive is ~90 % reliable, not certain
+### 2. The background keepalive is ~90 % reliable, not certain
 
 `BackgroundKeepAlive` keeps the app alive by looping a **real, low-level tone**
 through `AVAudioEngine` in an `.playback` `AVAudioSession`, with
@@ -366,7 +385,7 @@ process that was launched into the background and never went foreground
 (thread 838240, FB23789310). This app uses no background `URLSession`, so it does
 not apply — but do not add one casually.
 
-### 4. Local Network permission: not needed inbound, silently denied outbound
+### 3. Local Network permission: not needed inbound, silently denied outbound
 
 Per TN3179 (Apple, *Understanding local network privacy*), the permission applies
 asymmetrically:
@@ -390,20 +409,22 @@ the local network and because omitting it makes that failure worse. Note also
 that TN3179 covers only the permission gate; it says nothing about suspension, so
 Local Network privacy is not a factor in the keepalive at all.
 
-### 5. UDP ASSOCIATE is untested against a real carrier network
+### 4. UDP ASSOCIATE has been tested on one carrier only
 
 The SOCKS5 path is exercised by upstream's `Bench/` oracle and unit tests. The
-end-to-end tethering path — a real laptop, a real phone, a real carrier — has not
-been run from this fork.
+end-to-end tethering path has been run on one setup: an iPhone on T-Mobile US
+(IPv6-only, NAT64) with a Linux laptop sending everything through a sing-box
+TUN, including DNS, QUIC and WebRTC voice. Carriers with native IPv4, or with
+NAT64 behaving differently, have not been tried.
 
-### 6. No scheme-based tooling
+### 5. No scheme-based tooling
 
 Because there is no `SocksBypass` scheme, anything expecting one will not work
 out of the box: `xcodebuild -scheme`, Xcode's normal run/install flow, and most
 CI templates. Use `-target` (see [Build](#build)). The upstream
 `SocksBypass-Benchmark` scheme and the Android tree are not part of this fork.
 
-### 7. SideStore is a dependency, and it is not free of constraints
+### 6. SideStore is a dependency, and it is not free of constraints
 
 The install path depends on a third-party app
 ([SideStore](https://sidestore.io/)), which is free and MIT-licensed but outside
@@ -413,7 +434,7 @@ including SideStore itself**. We use one, so the budget is comfortable — but t
 app cannot be a fourth sideload. If SideStore breaks on a future iOS release,
 the [Linux fallback](#fallback-signing-and-installing-on-linux) is the way back.
 
-### 8. The laptop side needs its own proxy configuration
+### 7. The laptop side needs its own proxy configuration
 
 The phone serving SOCKS5 is half of the story. Getting *every* process on the
 laptop through it — including applications that ignore proxy settings, which is
