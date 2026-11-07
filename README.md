@@ -81,6 +81,9 @@ cellular explicitly. The WiFi side only ever carries the SOCKS5 session.
 
    Confirm the egress IP is your **phone's** carrier IP, not the laptop's.
 
+   To send **all** of the laptop's traffic through the phone instead, including
+   apps without proxy settings, see [`laptop/`](laptop/README.md) (Linux).
+
 The relay also supports **UDP ASSOCIATE**, so DNS over UDP works too.
 
 **IPv6-only carriers (T-Mobile US and others).** Destinations given as an IPv4
@@ -439,9 +442,10 @@ the [Linux fallback](#fallback-signing-and-installing-on-linux) is the way back.
 The phone serving SOCKS5 is half of the story. Getting *every* process on the
 laptop through it — including applications that ignore proxy settings, which is
 what most games do — needs a local TUN device and a translator such as
-`sing-box`. That is deliberately **not** part of this repository, which builds
-the phone app only. Until it is set up, expect to route proxy-aware clients
-individually.
+`sing-box`. [`laptop/`](laptop/README.md) has an installed, systemd-managed
+setup for Arch, and [`laptop/portable/`](laptop/portable/README.md) a
+single-script one that needs nothing installed. Both are Linux-only. Without
+one, route proxy-aware clients individually.
 
 ## Upstream and license
 
