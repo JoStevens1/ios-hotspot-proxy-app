@@ -1,5 +1,9 @@
 # Laptop side
 
+> **No package manager, or an immutable distro (Bazzite, Silverblue, SteamOS)?**
+> Use [`portable/`](portable/README.md) instead: one script and the standalone
+> sing-box binary in a folder, nothing installed.
+
 The phone serves SOCKS5 on `10.42.0.10:9876`. This directory makes **every**
 process on the laptop go through it — including applications that ignore proxy
 settings, which is most games — by way of a local TUN device and
