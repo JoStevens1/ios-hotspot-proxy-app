@@ -7,7 +7,9 @@ sing-box system-wide. For the installed, systemd-managed setup on Arch, see
 [`../README.md`](../README.md).
 
 `proxy-singbox.sh` sends **all** of the laptop's traffic through the phone:
-TCP, UDP and DNS, including apps that ignore proxy settings. It has been used
+TCP, UDP and DNS, including apps that ignore proxy settings. Other devices that
+join the laptop's hotspot (a console, a tablet, another laptop) are routed
+through it too, with no setup on their side. It has been used
 end to end on Bazzite with an iPhone on T-Mobile US, including Discord voice.
 
 ## Requirements
@@ -97,6 +99,17 @@ sudo ./proxy-singbox.sh up info 2>&1 | tee proxy.log
 `info` logs every connection; `debug` logs much more. The phone keeps its own
 log too: `curl http://<phone-ip>:9877/` (see the main README's Diagnostics).
 
+### Other devices on the hotspot
+
+While the script runs, the laptop acts as their router. A device that joins
+the hotspot gets its address and DNS from the hotspot as usual, and its traffic
+is forwarded into the tunnel and out through the phone. Nothing needs
+configuring on the device. Everyone shares the phone's cellular bandwidth and
+data allowance.
+
+The iPhone itself is the one device that is never forwarded: its traffic would
+go into the tunnel and straight back to it.
+
 ### If a run was killed
 
 If the script was killed rather than stopped with Ctrl+C (terminal closed,
@@ -108,7 +121,7 @@ sudo ./proxy-singbox.sh down
 
 ## What it changes while running
 
-Everything below is undone on exit.
+Everything below is undone on exit, except where noted.
 
 - **A TUN device, `tun0`,** with routes that send all traffic into sing-box.
   The hotspot's own subnet is excluded, so the connection to the phone does not
@@ -118,10 +131,13 @@ Everything below is undone on exit.
   over TCP, through the phone, against Cloudflare (`2606:4700:4700::1111`), so
   no lookup leaves the laptop any other way. If `/etc/resolv.conf` is not the
   `systemd-resolved` stub, it is pointed there and the original restored after.
-- **An nftables table, `proxy_singbox`,** that refuses to forward traffic
-  arriving from the hotspot. Otherwise the laptop would offer the phone an
-  internet connection through the tunnel, which leads straight back to the
-  phone.
+- **An nftables table, `proxy_singbox`,** that refuses to forward the
+  iPhone's own traffic. Otherwise the laptop would offer the phone an internet
+  connection through the tunnel, which leads straight back to the phone.
+  Other hotspot devices are forwarded normally.
+- **IPv4 forwarding** (`net.ipv4.ip_forward`) is switched on, so other hotspot
+  devices can be routed. NetworkManager hotspots already turn it on; it is left
+  on afterwards.
 
 It also writes `proxy-singbox.json`, the generated sing-box config, next to the
 script. It is regenerated on every start.
@@ -154,4 +170,5 @@ Each of these fixed a real failure:
 | `Config check failed` mentioning DNS servers | sing-box older than 1.12. |
 | `curl https://1.1.1.1` works but names don't resolve | Another DNS setup on the machine is overriding `systemd-resolved`; check `resolvectl status`. |
 | Everything stops at once | The phone app was suspended. Bring it to the foreground; new connections recover by themselves. |
+| Other hotspot devices connect but have no internet | A firewall (firewalld on Fedora-based distros) refusing to forward. Check `sudo firewall-cmd --get-active-zones`; the hotspot is normally in `nm-shared`. |
 | Voice calls hang at "Checking route" | Phone app older than this fork's `main`. Check its log for `UDP send failed`. |

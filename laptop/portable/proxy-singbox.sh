@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Route all of this PC's traffic through the iPhone SOCKS5 relay, using sing-box.
+# Other devices on the PC's hotspot are routed through it too.
 #
 # Usage:  sudo ./proxy-singbox.sh up          run in the foreground; Ctrl+C stops it
 #         sudo ./proxy-singbox.sh up info     same, logging every connection
@@ -73,13 +74,14 @@ EOF
 }
 
 block_forward() {
-    # Don't let the hotspot pass the phone's own traffic on to the internet:
-    # it would go into tun0 and straight back to the phone.
+    # Never forward the iPhone's own traffic: it would go into tun0 and straight
+    # back to the phone. Other devices on the hotspot are forwarded, and
+    # sing-box's routing sends their traffic into tun0 like the PC's own.
     nft -f - <<EOF
 table inet $NFT_TABLE {
     chain forward {
         type filter hook forward priority -10; policy accept;
-        iifname "$1" reject
+        iifname "$1" ip saddr $PROXY_IP reject
     }
 }
 EOF
@@ -157,7 +159,8 @@ up() {
 
     dns_on
     unblock_forward
-    block_forward "$hotspot_dev" || echo "Warning: couldn't block hotspot forwarding (nft failed)."
+    block_forward "$hotspot_dev" || echo "Warning: couldn't block the phone's forwarding (nft failed)."
+    sysctl -qw net.ipv4.ip_forward=1    # lets other hotspot devices through; NetworkManager hotspots already set it
     echo "Routing all traffic via the phone at $PROXY_IP:$PROXY_PORT (log level $LOG_LEVEL). Ctrl+C to stop."
     wait "$SB_PID"
 }
